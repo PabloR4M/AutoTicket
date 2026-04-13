@@ -23,31 +23,65 @@ class DataExtractor {
         let textoLimpio = texto.lowercased()
         
         // palabras que descalifican un segmento completo
+        // nota: "efectivo" y "contado" ya NO están aquí — los manejamos en el nivel 3
+        // porque en algunos tickets el total aparece pegado al método de pago
         let exclusiones: [String] = [
-            "efectivo", "cambio", "tarjeta", "visa", "mastercard", "amex",
+            "cambio", "tarjeta", "visa", "mastercard", "amex",
             "sub total", "subtotal", "neto",
             "articulos", "artículos", "piezas", "items",
             "propina", "tip", "descuento", "ahorro",
             "iva", "ieps"
         ]
         
+        // ── normaliza un string de monto a Double ──
+        // entiende formato mexicano (1,234.56), europeo (1.234,56) y simple (59,95 / 59.95)
         func limpiarMonto(_ raw: String) -> Double? {
-            let limpio = raw
-                .replacingOccurrences(of: ",", with: "")
-                .replacingOccurrences(of: "$", with: "")
-                .trimmingCharacters(in: .whitespaces)
+            let s = raw.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespaces)
+            var limpio = s
+            // europeo: 1.234,56 → quitar puntos de miles, coma → punto decimal
+            if s.range(of: "^[0-9]{1,3}(\\.[0-9]{3})*(,[0-9]{2})$", options: .regularExpression) != nil {
+                limpio = s.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+            // mexicano/usa: 1,234.56 → solo quitar comas de miles
+            } else if s.range(of: "^[0-9]{1,3}(,[0-9]{3})*(\\.[0-9]{2})$", options: .regularExpression) != nil {
+                limpio = s.replacingOccurrences(of: ",", with: "")
+            // simple con separador: 59,95 o 59.95 → la coma/punto es el decimal
+            } else if s.range(of: "^[0-9]+[,.][0-9]{2}$", options: .regularExpression) != nil {
+                limpio = s.replacingOccurrences(of: ",", with: ".")
+            }
             return Double(limpio)
+        }
+        
+        // extrae todos los montos válidos (con decimales) de un string
+        // el patrón bi-formato reconoce tanto 1,234.56 como 1.234,56 como 59,95
+        func extraerMontos(de seg: String) -> [Double] {
+            let patron = "((?:[0-9]{1,3}(?:[.,][0-9]{3})*)[.,][0-9]{2})"
+            guard let regex = try? NSRegularExpression(pattern: patron) else { return [] }
+            let rango = NSRange(seg.startIndex..., in: seg)
+            return regex.matches(in: seg, range: rango).compactMap { match in
+                guard let r = Range(match.range(at: 1), in: seg) else { return nil }
+                let v = limpiarMonto(String(seg[r]))
+                return (v ?? 0) >= 1.0 ? v : nil   // descartamos valores menores a 1 (número de artículos)
+            }
         }
         
         func segmentoEsExcluido(_ seg: String) -> Bool {
             return exclusiones.contains { seg.contains($0) }
         }
         
-        // re-segmentamos el texto partiendo en cada palabra clave de ticket
-        // esto resuelve el caso en que Vision colapsa todo en una sola línea gigante
+        // un segmento "total X" es válido solo si:
+        // 1. el monto está en los primeros 40 chars (no enterrado en descripción de producto)
+        // 2. no contiene asteriscos decorativos de pie de ticket ("total **** i.v.a...")
+        func segmentoTotalEsValido(_ seg: String) -> Bool {
+            guard !seg.contains("***") else { return false }
+            let zonaInicial = String(seg.prefix(40))
+            return !extraerMontos(de: zonaInicial).isEmpty
+        }
+        
+        // ── re-segmentación por palabras clave ──
+        // resuelve el caso en que Vision colapsa todo el ticket en una sola línea
         // el lookahead (?=...) parte sin consumir la palabra, que queda al inicio del segmento
+        // orden importante: los compuestos ("total neto") deben ir ANTES que el simple ("total")
         let patronSplit = [
-            // primero los compuestos para no partir "total neto" en "total" + "neto"
             "(?=\\btotal\\s+(?:neto|general|a\\s+pagar)\\b)",
             "(?=\\bimporte\\s+(?:total|a\\s+pagar)\\b)",
             "(?=\\bsub\\s*total\\b)",
@@ -57,87 +91,70 @@ class DataExtractor {
             "(?=\\befectivo\\b)",
             "(?=\\bcambio\\b)",
             "(?=\\btarjeta\\b)",
-            // "total" solo — al final para no interferir con los compuestos de arriba
             "(?=\\btotal(?!\\s+(?:neto|general|a\\s+pagar))\\b)"
         ].joined(separator: "|")
         
-        // primero intentamos con saltos de línea reales si los hay
-        // si el texto viene todo en una línea, el split por \n da un array de 1 elemento
-        // en ambos casos, después re-segmentamos cada trozo por palabras clave
-        let lineasBase = textoLimpio.components(separatedBy: .newlines)
+        guard let regexSplit = try? NSRegularExpression(pattern: patronSplit) else { return 0.0 }
         
+        // aplicamos la re-segmentación sobre cada línea real (si las hay)
+        // y también sobre el texto completo por si todo vino en una línea
         var segmentos: [String] = []
+        let lineasBase = textoLimpio.components(separatedBy: .newlines)
         for linea in lineasBase {
-            guard let regex = try? NSRegularExpression(pattern: patronSplit) else {
-                segmentos.append(linea)
-                continue
-            }
-            // insertamos marcador antes de cada palabra clave y luego partimos por él
-            let marcado = regex.stringByReplacingMatches(
+            let marcado = regexSplit.stringByReplacingMatches(
                 in: linea,
                 range: NSRange(linea.startIndex..., in: linea),
-                withTemplate: "\n$0"   // $0 preserva la palabra clave al inicio del segmento
+                withTemplate: "\n$0"
             )
-            let sub = marcado.components(separatedBy: "\n").map {
-                $0.trimmingCharacters(in: .whitespaces)
-            }.filter { !$0.isEmpty }
+            let sub = marcado.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
             segmentos.append(contentsOf: sub)
         }
         
-        // patrón para extraer cualquier monto con decimales dentro de un segmento
-        let patronMonto = "\\$?\\s*((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,6})(?:\\.[0-9]{2})?)"
-        guard let regexMonto = try? NSRegularExpression(pattern: patronMonto) else { return 0.0 }
-        
-        func extraerMontos(de seg: String) -> [Double] {
-            let rango = NSRange(seg.startIndex..., in: seg)
-            return regexMonto.matches(in: seg, range: rango).compactMap { match in
-                guard let r = Range(match.range(at: 1), in: seg) else { return nil }
-                return limpiarMonto(String(seg[r]))
-            }.filter { $0 > 0 }
-        }
-        
-        // orden de búsqueda: del patrón más específico al más genérico
-        // para cada tipo buscamos en todos los segmentos antes de bajar al siguiente
-        
-        // nivel 1 — "total a pagar", "total del pedido": máxima confianza, un solo monto
+        // ── nivel 1: frases explícitas de alta confianza ──
+        // "total a pagar", "total del pedido", "importe total", "total general"
+        let patronesAlta = [
+            "^total\\s+(?:a\\s+pagar|del\\s+pedido|de\\s+(?:la\\s+)?(?:compra|cuenta|venta))",
+            "^(?:importe\\s+(?:total|a\\s+pagar)|total\\s+general)"
+        ]
         for seg in segmentos {
             guard !segmentoEsExcluido(seg) else { continue }
-            if seg.range(of: "total\\s+(?:a\\s+pagar|del\\s+pedido|de\\s+(?:la\\s+)?(?:compra|cuenta|venta))",
-                         options: .regularExpression) != nil {
-                if let monto = extraerMontos(de: seg).first { return monto }
+            for patron in patronesAlta {
+                if seg.range(of: patron, options: .regularExpression) != nil {
+                    if let monto = extraerMontos(de: seg).first { return monto }
+                }
             }
         }
         
-        // nivel 2 — "importe total", "total general"
+        // ── nivel 2: "total" solo, monto cerca, sin asteriscos decorativos ──
         for seg in segmentos {
             guard !segmentoEsExcluido(seg) else { continue }
-            if seg.range(of: "(?:importe\\s+(?:total|a\\s+pagar)|total\\s+general)",
-                         options: .regularExpression) != nil {
-                if let monto = extraerMontos(de: seg).first { return monto }
+            guard seg.hasPrefix("total"), segmentoTotalEsValido(seg) else { continue }
+            // miramos solo los primeros 50 chars para no agarrar montos de descripciones lejanas
+            let montos = extraerMontos(de: String(seg.prefix(50)))
+            // filtramos enteros chicos que sean número de artículos (ej: "total 1")
+            let validos = montos.filter { $0 != Double(Int($0)) || $0 >= 10 }
+            if let ultimo = validos.last { return ultimo }
+        }
+        
+        // ── nivel 3 (fallback): primer monto del segmento "efectivo" o "contado" ──
+        // en tickets como Zara España, Vision pega el total cobrado al método de pago:
+        // "efectivo eur 59.95 100,00" → primer monto (59.95) es el total, el segundo el billete
+        for seg in segmentos {
+            if seg.hasPrefix("efectivo") || seg.hasPrefix("contado") {
+                if let primer = extraerMontos(de: seg).first { return primer }
             }
         }
         
-        // nivel 3 — "total" solo
-        // tomamos el ÚLTIMO monto del segmento porque cuando Vision colapsa líneas
-        // el orden es siempre: subtotal → iva → TOTAL (el último y más alto)
-        for seg in segmentos {
-            guard !segmentoEsExcluido(seg) else { continue }
-            guard seg.hasPrefix("total") else { continue }
-            let montos = extraerMontos(de: seg)
-            if let ultimo = montos.last { return ultimo }
-        }
-        
-        // fallback: si la re-segmentación no encontró nada,
-        // buscamos el monto más alto en segmentos no excluidos
-        // descartando el monto máximo absoluto (que suele ser el billete con que pagaron)
+        // ── fallback final: segundo monto más alto de todo el ticket ──
+        // el más alto suele ser el billete con que pagaron
         var todosLosMontos: [Double] = []
         for seg in segmentos {
             guard !segmentoEsExcluido(seg) else { continue }
             todosLosMontos.append(contentsOf: extraerMontos(de: seg))
         }
-        
         let ordenados = todosLosMontos.sorted(by: >)
-        // el segundo más alto suele ser el total real; el primero suele ser el billete
         return ordenados.dropFirst().first ?? ordenados.first ?? 0.0
     }
     
